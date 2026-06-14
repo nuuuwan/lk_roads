@@ -6,7 +6,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import requests
-from shapely.geometry import LineString, MultiLineString
+from shapely.geometry import LineString, MultiLineString, Point
 
 GEOJSON_PATH = os.path.join("data", "lk_roads.geojson")
 OUTPUT_DIR = "images"
@@ -15,6 +15,14 @@ ELEVATION_CACHE_PATH = os.path.join("data", "elevation_cache.json")
 LOCATION_CACHE_PATH = os.path.join("data", "location_cache.json")
 LOCATION_PROXIMITY_KM = 5.0
 ELEVATION_WINDOW = 10
+DISTRICTS_URL = (
+    "https://raw.githubusercontent.com/nuuuwan/lk_admin_regions"
+    "/refs/heads/main/data/geo/topojson/e4_medium/districts.topojson"
+)
+PROVINCES_URL = (
+    "https://raw.githubusercontent.com/nuuuwan/lk_admin_regions"
+    "/refs/heads/main/data/geo/topojson/e4_medium/provinces.topojson"
+)
 
 
 def _load_location_index():
@@ -47,6 +55,26 @@ def _get_annotation_places(coords, threshold_km=LOCATION_PROXIMITY_KM):
     return results
 
 
+def _get_district_data(road_id):
+    """Return (touched_gdf, district_color_map) for districts the road passes through."""
+    gdf_roads = gpd.read_file(GEOJSON_PATH)
+    road = gdf_roads[gdf_roads["CLASS"] == road_id]
+    if road.empty:
+        return None, {}
+    districts_gdf = _load_admin_gdf(DISTRICTS_URL)
+    provinces_gdf = _load_admin_gdf(PROVINCES_URL)
+    road_geom = road.dissolve().to_crs("EPSG:4326").geometry.iloc[0]
+    touched = districts_gdf[districts_gdf.intersects(road_geom)].copy()
+    prov_name_map = dict(zip(provinces_gdf["id"], provinces_gdf["name"]))
+    touched["province_name"] = touched["province_id"].map(prov_name_map)
+    district_names = sorted(touched["name"].dropna().unique())
+    cmap = plt.colormaps.get_cmap("Set2").resampled(
+        max(len(district_names), 1)
+    )
+    district_color = {d: cmap(i) for i, d in enumerate(district_names)}
+    return touched, district_color
+
+
 def plot_road(road_id):
     gdf = gpd.read_file(GEOJSON_PATH)
     all_roads = gdf[gdf["CLASS"].notna()]
@@ -56,11 +84,48 @@ def plot_road(road_id):
         print(f"No road found with id '{road_id}'")
         return
 
+    touched, district_color = _get_district_data(road_id)
+
     fig, ax = plt.subplots(figsize=(14, 18))
     ax.set_aspect("equal")
     ax.axis("off")
 
-    road.plot(ax=ax, color="crimson", linewidth=1.5, zorder=2)
+    # Shade districts individually in the background
+    if touched is not None and not touched.empty:
+        for _, row in touched.iterrows():
+            color = district_color.get(row["name"], "#cccccc")
+            gpd.GeoDataFrame([row], geometry="geometry", crs="EPSG:4326").plot(
+                ax=ax,
+                color=color,
+                edgecolor="white",
+                linewidth=0.8,
+                alpha=0.55,
+                zorder=1,
+            )
+            centroid = row.geometry.centroid
+            ax.text(
+                centroid.x,
+                centroid.y,
+                row["name"],
+                fontsize=6,
+                ha="center",
+                va="center",
+                color="#333333",
+                fontweight="bold",
+                zorder=2,
+            )
+
+        from matplotlib.patches import Patch
+
+        handles = [
+            Patch(facecolor=district_color[d], label=d, alpha=0.7)
+            for d in sorted(district_color)
+        ]
+        ax.legend(
+            handles=handles, title="District", loc="lower left", fontsize=7
+        )
+
+    road.plot(ax=ax, color="crimson", linewidth=1.5, zorder=4)
 
     dissolved = road.dissolve()
     centroid = dissolved.geometry.iloc[0].centroid
@@ -73,14 +138,13 @@ def plot_road(road_id):
         va="center",
         color="crimson",
         fontweight="bold",
-        zorder=3,
+        zorder=5,
     )
 
-    # Annotate places from location index that are close to this road
     road_coords = _extract_coords(dissolved.geometry.iloc[0])
     annotation_places = _get_annotation_places(road_coords)
     for _, lon, lat, place in annotation_places:
-        ax.plot(lon, lat, "o", color="darkred", markersize=4, zorder=4)
+        ax.plot(lon, lat, "o", color="darkred", markersize=4, zorder=6)
         ax.text(
             lon,
             lat,
@@ -89,10 +153,7 @@ def plot_road(road_id):
             ha="center",
             va="bottom",
             color="darkred",
-            bbox=dict(
-                boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.75
-            ),
-            zorder=5,
+            zorder=7,
         )
 
     ax.set_title(f"Sri Lanka Road: {road_id}", fontsize=16, pad=12)
@@ -209,10 +270,59 @@ def plot_elevation(road_id):
     ]
 
     annotation_places = _get_annotation_places(coords)
+    touched, district_color = _get_district_data(road_id)
+
+    # Map each coord to a district name
+    coord_district = {}
+    if touched is not None and not touched.empty:
+        for lon, lat in coords:
+            pt = Point(lon, lat)
+            for _, row in touched.iterrows():
+                if row.geometry.contains(pt):
+                    coord_district[(lon, lat)] = row["name"]
+                    break
 
     fig, ax = plt.subplots(figsize=(12, 4))
-    ax.plot(distances, elevations, color="steelblue", linewidth=1.5)
-    ax.fill_between(distances, elevations, alpha=0.2, color="steelblue")
+
+    # Shade background by district spans
+    if district_color:
+        prev_district, span_start = None, 0.0
+        for i, (lon, lat) in enumerate(coords):
+            district = coord_district.get((lon, lat))
+            if district != prev_district:
+                if prev_district is not None:
+                    ax.axvspan(
+                        span_start,
+                        distances[i],
+                        alpha=0.18,
+                        color=district_color.get(prev_district, "#cccccc"),
+                        zorder=0,
+                    )
+                span_start = distances[i]
+                prev_district = district
+        if prev_district is not None:
+            ax.axvspan(
+                span_start,
+                distances[-1],
+                alpha=0.18,
+                color=district_color.get(prev_district, "#cccccc"),
+                zorder=0,
+            )
+
+        from matplotlib.patches import Patch
+
+        handles = [
+            Patch(facecolor=district_color[d], label=d, alpha=0.5)
+            for d in sorted(district_color)
+        ]
+        ax.legend(
+            handles=handles, title="District", fontsize=7, loc="upper left"
+        )
+
+    ax.plot(distances, elevations, color="steelblue", linewidth=1.5, zorder=2)
+    ax.fill_between(
+        distances, elevations, alpha=0.2, color="steelblue", zorder=1
+    )
     ax.set_xlabel("Distance from origin (km)")
     ax.set_ylabel("Elevation (m)")
     ax.set_title(f"Elevation Profile: Road {road_id}")
@@ -242,6 +352,36 @@ def plot_elevation(road_id):
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved elevation profile to {output_path}")
+
+
+def _load_admin_gdf(url):
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    import tempfile
+
+    tmp = tempfile.mktemp(suffix=".topojson")
+    with open(tmp, "wb") as f:
+        f.write(r.content)
+    return gpd.read_file(tmp).set_crs("EPSG:4326", allow_override=True)
+
+
+def get_districts(latlngs):
+    """
+    Given a list of (lat, lon) tuples, return a list of district names
+    (or None) for each point.
+    """
+    gdf = _load_admin_gdf(DISTRICTS_URL)
+    points = gpd.GeoDataFrame(
+        geometry=[Point(lon, lat) for lat, lon in latlngs],
+        crs="EPSG:4326",
+    )
+    joined = gpd.sjoin(
+        points,
+        gdf[["id", "name", "province_id", "geometry"]],
+        how="left",
+        predicate="within",
+    )
+    return joined["name"].tolist()
 
 
 def analyze(road_id):
