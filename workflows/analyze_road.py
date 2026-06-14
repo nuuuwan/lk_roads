@@ -7,14 +7,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import requests
 from shapely.geometry import LineString, MultiLineString, Point
+from shapely.ops import linemerge
 
 GEOJSON_PATH = os.path.join("data", "lk_roads.geojson")
 OUTPUT_DIR = "images"
 ELEVATION_API = "https://api.open-elevation.com/api/v1/lookup"
 ELEVATION_CACHE_PATH = os.path.join("data", "elevation_cache.json")
 LOCATION_CACHE_PATH = os.path.join("data", "location_cache.json")
-LOCATION_PROXIMITY_KM = 5.0
-ELEVATION_WINDOW = 10
+LOCATION_PROXIMITY_KM = 2
+ELEVATION_WINDOW = 20
 DISTRICTS_URL = (
     "https://raw.githubusercontent.com/nuuuwan/lk_admin_regions"
     "/refs/heads/main/data/geo/topojson/e4_medium/districts.topojson"
@@ -164,18 +165,58 @@ def plot_road(road_id):
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved map to {output_path}")
+    os.system(f"open {output_path}")
+
+
+def _ordered_coords_and_distances(geometry):
+    """
+    Return (coords, distances) with coords stitched into the best-ordered path
+    by greedily connecting nearest endpoints between disconnected parts.
+    """
+    if isinstance(geometry, MultiLineString):
+        geometry = linemerge(geometry)
+
+    if isinstance(geometry, LineString):
+        parts = [list(geometry.coords)]
+    else:
+        parts = [list(g.coords) for g in geometry.geoms]
+
+    # Greedy stitch: repeatedly connect the nearest unvisited endpoint
+    def _endpoint_dist(a, b):
+        lon1, lat1 = a
+        lon2, lat2 = b
+        return _haversine_km(lat1, lon1, lat2, lon2)
+
+    stitched = parts[0]
+    remaining = [list(p) for p in parts[1:]]
+    while remaining:
+        end = stitched[-1]
+        best_i, best_rev, best_d = 0, False, float("inf")
+        for i, seg in enumerate(remaining):
+            d_fwd = _endpoint_dist(end, seg[0])
+            d_rev = _endpoint_dist(end, seg[-1])
+            if d_fwd < best_d:
+                best_i, best_rev, best_d = i, False, d_fwd
+            if d_rev < best_d:
+                best_i, best_rev, best_d = i, True, d_rev
+        seg = remaining.pop(best_i)
+        if best_rev:
+            seg = seg[::-1]
+        stitched.extend(seg)
+
+    distances = [0.0]
+    for i in range(1, len(stitched)):
+        lon1, lat1 = stitched[i - 1]
+        lon2, lat2 = stitched[i]
+        distances.append(distances[-1] + _haversine_km(lat1, lon1, lat2, lon2))
+
+    return stitched, distances
 
 
 def _extract_coords(geometry):
-    """Return a flat list of (lon, lat) tuples from a LineString or MultiLineString."""
-    if isinstance(geometry, LineString):
-        return list(geometry.coords)
-    if isinstance(geometry, MultiLineString):
-        coords = []
-        for part in geometry.geoms:
-            coords.extend(part.coords)
-        return coords
-    return []
+    """Return a flat ordered list of (lon, lat) tuples."""
+    coords, _ = _ordered_coords_and_distances(geometry)
+    return coords
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):
@@ -232,13 +273,7 @@ def plot_elevation(road_id):
         return
 
     geometry = road.dissolve().geometry.iloc[0]
-    coords = _extract_coords(geometry)
-
-    distances = [0.0]
-    for i in range(1, len(coords)):
-        lon1, lat1 = coords[i - 1]
-        lon2, lat2 = coords[i]
-        distances.append(distances[-1] + _haversine_km(lat1, lon1, lat2, lon2))
+    coords, distances = _ordered_coords_and_distances(geometry)
 
     cache = _load_elevation_cache()
     missing = [
@@ -270,54 +305,8 @@ def plot_elevation(road_id):
     ]
 
     annotation_places = _get_annotation_places(coords)
-    touched, district_color = _get_district_data(road_id)
-
-    # Map each coord to a district name
-    coord_district = {}
-    if touched is not None and not touched.empty:
-        for lon, lat in coords:
-            pt = Point(lon, lat)
-            for _, row in touched.iterrows():
-                if row.geometry.contains(pt):
-                    coord_district[(lon, lat)] = row["name"]
-                    break
 
     fig, ax = plt.subplots(figsize=(12, 4))
-
-    # Shade background by district spans
-    if district_color:
-        prev_district, span_start = None, 0.0
-        for i, (lon, lat) in enumerate(coords):
-            district = coord_district.get((lon, lat))
-            if district != prev_district:
-                if prev_district is not None:
-                    ax.axvspan(
-                        span_start,
-                        distances[i],
-                        alpha=0.18,
-                        color=district_color.get(prev_district, "#cccccc"),
-                        zorder=0,
-                    )
-                span_start = distances[i]
-                prev_district = district
-        if prev_district is not None:
-            ax.axvspan(
-                span_start,
-                distances[-1],
-                alpha=0.18,
-                color=district_color.get(prev_district, "#cccccc"),
-                zorder=0,
-            )
-
-        from matplotlib.patches import Patch
-
-        handles = [
-            Patch(facecolor=district_color[d], label=d, alpha=0.5)
-            for d in sorted(district_color)
-        ]
-        ax.legend(
-            handles=handles, title="District", fontsize=7, loc="upper left"
-        )
 
     ax.plot(distances, elevations, color="steelblue", linewidth=1.5, zorder=2)
     ax.fill_between(
@@ -352,6 +341,7 @@ def plot_elevation(road_id):
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved elevation profile to {output_path}")
+    os.system(f"open {output_path}")
 
 
 def _load_admin_gdf(url):
